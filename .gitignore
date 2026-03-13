@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# ComfyUI-A2SB specific
+temp_repo/
+import_err.txt
+
+# Local models/weights (if any were downloaded to root)
+models/
+ckpt/

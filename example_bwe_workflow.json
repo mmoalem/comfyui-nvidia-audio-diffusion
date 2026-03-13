@@ -1,0 +1,66 @@
+{
+  "1": {
+    "inputs": {
+      "audio": "example.wav"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "Load Audio"
+    }
+  },
+  "2": {
+    "inputs": {
+      "model_type": "2-split (recommended)",
+      "use_ot_ode": false
+    },
+    "class_type": "A2SB_ModelLoader",
+    "_meta": {
+      "title": "Load A2SB Audio Model"
+    }
+  },
+  "3": {
+    "inputs": {
+      "steps": 50,
+      "cutoff_freq": 0,
+      "batch_size": 16,
+      "unload_model": true,
+      "a2sb_model": [
+        "2",
+        0
+      ],
+      "audio": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "A2SB_BandwidthExtension",
+    "_meta": {
+      "title": "A2SB Bandwidth Extension"
+    }
+  },
+  "4": {
+    "inputs": {
+      "audio": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "PreviewAudio",
+    "_meta": {
+      "title": "Preview Audio"
+    }
+  },
+  "5": {
+    "inputs": {
+      "filename_prefix": "A2SB_BWE",
+      "audio": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SaveAudio",
+    "_meta": {
+      "title": "Save Audio"
+    }
+  }
+}
