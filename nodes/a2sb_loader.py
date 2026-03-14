@@ -10,6 +10,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from a2sb.networks import AttnUNetF
 from a2sb.diffusion import Diffusion
 
+try:
+    from torchao.quantization import quantize_, int8_weight_only, int4_weight_only
+    TORCHAO_AVAILABLE = True
+except ImportError:
+    TORCHAO_AVAILABLE = False
+
 class A2SB_ModelLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -20,6 +26,7 @@ class A2SB_ModelLoader:
                 "use_ot_ode": ("BOOLEAN", {"default": False}),
                 "use_compile": ("BOOLEAN", {"default": False}),
                 "attention_type": (["sdpa", "sage"], {"default": "sdpa"}),
+                "quantize": (["none", "int8wo", "int4wo"], {"default": "none"}),
             }
         }
 
@@ -94,9 +101,14 @@ class A2SB_ModelLoader:
         )
         return patcher
 
-    def load_model(self, model_type, precision, use_ot_ode, use_compile, attention_type):
+    def load_model(self, model_type, precision, use_ot_ode, use_compile, attention_type, quantize):
         import logging
-        logging.info(f"[A2SB] Loading model type: {model_type}, precision: {precision}, attention: {attention_type}")
+        logging.info(f"[A2SB] Loading model type: {model_type}, precision: {precision}, attention: {attention_type}, quantize: {quantize}")
+        
+        # Performance Flags for Blackwell/Ada
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True # Autotune conv kernels on first run
         
         dtype = torch.float32
         if precision == "bf16":
@@ -117,17 +129,40 @@ class A2SB_ModelLoader:
             net1 = self.instantiate_network(attention_type)
             net1.to(dtype).to(memory_format=torch.channels_last)
             net1 = self.load_weights(net1, p1, dtype)
+            
+            if quantize != "none" and TORCHAO_AVAILABLE:
+                q_func = int8_weight_only() if quantize == "int8wo" else int4_weight_only()
+                print(f"[A2SB] Applying {quantize} quantization to model 1...")
+                quantize_(net1, q_func)
+            
             if use_compile:
-                print("[A2SB] Compiling model 1...")
-                net1 = torch.compile(net1)
+                # Use explicit performance options instead of mode="max-autotune" to avoid conflict with options parameter
+                net1 = torch.compile(net1, fullgraph=False, options={
+                    "triton.cudagraphs": False,
+                    "max_autotune": True,
+                    "verbose_progress": False,
+                    "coordinate_descent_tuning": True
+                })
             models.append(self.wrap_model(net1))
             
             net2 = self.instantiate_network(attention_type)
             net2.to(dtype).to(memory_format=torch.channels_last)
             net2 = self.load_weights(net2, p2, dtype)
+            
+            if quantize != "none" and TORCHAO_AVAILABLE:
+                q_func = int8_weight_only() if quantize == "int8wo" else int4_weight_only()
+                print(f"[A2SB] Applying {quantize} quantization to model 2...")
+                quantize_(net2, q_func)
+
             if use_compile:
-                print("[A2SB] Compiling model 2...")
-                net2 = torch.compile(net2)
+                # Use valid Inductor options to replicate max-autotune while disabling cudagraphs and verbosity
+                net2 = torch.compile(net2, fullgraph=False, options={
+                    "max_autotune": True,
+                    "verbose_progress": False,
+                    "triton.cudagraphs": False,
+                    "coordinate_descent_tuning": True,
+                    "verbose_progress": False
+                })
             models.append(self.wrap_model(net2))
             
             t_cutoffs = [0.5]
@@ -139,9 +174,20 @@ class A2SB_ModelLoader:
             net1 = self.instantiate_network(attention_type)
             net1.to(dtype).to(memory_format=torch.channels_last)
             net1 = self.load_weights(net1, p1, dtype)
+            
+            if quantize != "none" and TORCHAO_AVAILABLE:
+                q_func = int8_weight_only() if quantize == "int8wo" else int4_weight_only()
+                print(f"[A2SB] Applying {quantize} quantization...")
+                quantize_(net1, q_func)
+                
             if use_compile:
-                print("[A2SB] Compiling model...")
-                net1 = torch.compile(net1)
+                # Use explicit performance options instead of mode="max-autotune" to avoid conflict with options parameter
+                net1 = torch.compile(net1, fullgraph=False, options={
+                    "triton.cudagraphs": False,
+                    "max_autotune": True,
+                    "verbose_progress": False,
+                    "coordinate_descent_tuning": True
+                })
             models.append(self.wrap_model(net1))
             t_cutoffs = []
             

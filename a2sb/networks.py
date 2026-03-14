@@ -27,12 +27,23 @@ try:
 except ImportError:
     SAGE_ATTENTION_AVAILABLE = False
 
+@torch._dynamo.disable
+def _sageattn_wrapper(q, k, v):
+    """Wrapper to prevent torch.compile from tracing into SageAttention custom kernels."""
+    return sageattn(q, k, v, tensor_layout="NHD", is_causal=False)
+
 _SAGE_WARNING_PRINTED = {} # Track warnings by reason
 _SAGE_GLOBALLY_DISABLED = False # Permanent fallback if any kernel fails
 
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
+        # PyTorch >= 2.0 supports bf16 GroupNorm natively on CUDA with high performance
+        # Only fall back to float32 on CPU or fp16 (which has precision/overflow issues with small eps)
+        if x.device.type == "cuda" and x.dtype == torch.bfloat16:
+            return super().forward(x)
+        
+        # Original safe path for fp16/cpu or other dtypes
         weight = self.weight.float() if self.weight is not None else None
         bias = self.bias.float() if self.bias is not None else None
         return F.group_norm(x.float(), self.num_groups, weight, bias, self.eps).type(x.dtype)
@@ -510,7 +521,8 @@ class RotaryAttentionPool2d(nn.Module):
                 # tensor_layout="NHD" is required — tensors are [B, Seq, Heads, Dim].
                 # Without it SA2 assumes HND layout and dispatches the wrong kernel,
                 # causing cudaErrorNoKernelImageForDevice on Blackwell (SM_120) GPUs.
-                attn_out = sageattn(q, k, v, tensor_layout="NHD", is_causal=False)
+                # Wrapped in @torch._dynamo.disable to prevent Inductor crashes on Windows
+                attn_out = _sageattn_wrapper(q, k, v)
             except Exception as e:
                 error_str = str(e)
                 if "no kernel image" in error_str or "cudaErrorNoKernelImageForDevice" in error_str:

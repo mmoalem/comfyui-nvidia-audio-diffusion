@@ -2,3 +2,4 @@ einops>=0.6.1
 rotary-embedding-torch>=0.3.5
 librosa>=0.10.0
 soundfile>=0.12.1
+torchao
