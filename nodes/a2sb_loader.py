@@ -19,6 +19,7 @@ class A2SB_ModelLoader:
                 "precision": (["fp32", "bf16", "fp16"], {"default": "bf16"}),
                 "use_ot_ode": ("BOOLEAN", {"default": False}),
                 "use_compile": ("BOOLEAN", {"default": False}),
+                "attention_type": (["sdpa", "sage"], {"default": "sdpa"}),
             }
         }
 
@@ -44,7 +45,7 @@ class A2SB_ModelLoader:
                 shutil.move(actual_path, file_path)
         return file_path
 
-    def instantiate_network(self):
+    def instantiate_network(self, attention_type):
         return AttnUNetF(
             n_updown_levels=5,
             in_channels=3,
@@ -55,7 +56,8 @@ class A2SB_ModelLoader:
             n_attn_heads=8,
             attention_levels=[3, 4],
             use_attn_input_norm=True,
-            num_res_blocks=2
+            num_res_blocks=2,
+            attention_type=attention_type
         )
 
     def load_weights(self, network, checkpoint_path, dtype):
@@ -92,9 +94,9 @@ class A2SB_ModelLoader:
         )
         return patcher
 
-    def load_model(self, model_type, precision, use_ot_ode, use_compile):
+    def load_model(self, model_type, precision, use_ot_ode, use_compile, attention_type):
         import logging
-        logging.info(f"[A2SB] Loading model type: {model_type}, precision: {precision}")
+        logging.info(f"[A2SB] Loading model type: {model_type}, precision: {precision}, attention: {attention_type}")
         
         dtype = torch.float32
         if precision == "bf16":
@@ -112,7 +114,7 @@ class A2SB_ModelLoader:
             p1 = self.download_model(file1)
             p2 = self.download_model(file2)
             
-            net1 = self.instantiate_network()
+            net1 = self.instantiate_network(attention_type)
             net1.to(dtype).to(memory_format=torch.channels_last)
             net1 = self.load_weights(net1, p1, dtype)
             if use_compile:
@@ -120,7 +122,7 @@ class A2SB_ModelLoader:
                 net1 = torch.compile(net1)
             models.append(self.wrap_model(net1))
             
-            net2 = self.instantiate_network()
+            net2 = self.instantiate_network(attention_type)
             net2.to(dtype).to(memory_format=torch.channels_last)
             net2 = self.load_weights(net2, p2, dtype)
             if use_compile:
@@ -134,7 +136,7 @@ class A2SB_ModelLoader:
             file1 = "A2SB_onesplit_0.0_1.0_release.ckpt"
             p1 = self.download_model(file1)
             
-            net1 = self.instantiate_network()
+            net1 = self.instantiate_network(attention_type)
             net1.to(dtype).to(memory_format=torch.channels_last)
             net1 = self.load_weights(net1, p1, dtype)
             if use_compile:

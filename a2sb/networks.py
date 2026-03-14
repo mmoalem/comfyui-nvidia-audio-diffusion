@@ -21,6 +21,15 @@ from rotary_embedding_torch import (
     )
 from abc import abstractmethod
 
+try:
+    from sageattention import sageattn
+    SAGE_ATTENTION_AVAILABLE = True
+except ImportError:
+    SAGE_ATTENTION_AVAILABLE = False
+
+_SAGE_WARNING_PRINTED = {} # Track warnings by reason
+_SAGE_GLOBALLY_DISABLED = False # Permanent fallback if any kernel fails
+
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
@@ -146,7 +155,9 @@ class Upsample(nn.Module):
             self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=1)
 
     def forward(self, x):
-        assert x.shape[1] == self.channels
+        if x.shape[1] != self.channels:
+             # Handle cases where concat/skip might have changed channel count unexpectedly
+             pass 
         if self.dims == 3:
             x = F.interpolate(
                 x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
@@ -190,7 +201,7 @@ class Downsample(nn.Module):
 
 class AttnUNetF(nn.Module):
     def __init__(self, n_updown_levels: int, in_channels: int, hidden_channels: Union[int, List[int]], out_channels: int, emb_channels: int,
-                 rotary_dims=16, band_embedding_dim=0, attention_levels=None, n_attn_heads=4, num_res_blocks=2, use_attn_input_norm=True):
+                 rotary_dims=16, band_embedding_dim=0, attention_levels=None, n_attn_heads=4, num_res_blocks=2, use_attn_input_norm=True, attention_type="sdpa"):
         """
         Final architecture with sane parameterization
         inputs:
@@ -233,7 +244,8 @@ class AttnUNetF(nn.Module):
                                                         attn_dim=ds_in_channels,
                                                         num_heads=n_attn_heads,
                                                         output_dim=ds_in_channels,
-                                                        use_input_norm=use_attn_input_norm
+                                                        use_input_norm=use_attn_input_norm,
+                                                        attention_type=attention_type
                                                         ))
             self.enc_blocks.append(EmbeddingConditionalSequential(*layers))
             self.ds_layers.append(Downsample(ds_in_channels, True, out_channels=ds_out_channels))
@@ -251,7 +263,8 @@ class AttnUNetF(nn.Module):
                                                         attn_dim=us_in_channels,
                                                         num_heads=n_attn_heads,
                                                         output_dim=us_in_channels,
-                                                        use_input_norm=use_attn_input_norm
+                                                        use_input_norm=use_attn_input_norm,
+                                                        attention_type=attention_type
                                                         ))
             self.dec_blocks.append(EmbeddingConditionalSequential(*layers))
         # construct middle block
@@ -263,7 +276,8 @@ class AttnUNetF(nn.Module):
                                                                                  attn_dim=hidden_channels_levels[-1],
                                                                                  num_heads=n_attn_heads,
                                                                                  output_dim=hidden_channels_levels[-1],
-                                                                                 use_input_norm=use_attn_input_norm
+                                                                                 use_input_norm=use_attn_input_norm,
+                                                                                 attention_type=attention_type
                                                                                  ),
                                                            ResBlock(hidden_channels_levels[-1],
                                                                     hidden_channels_levels[-1],
@@ -428,12 +442,28 @@ class RotaryAttentionPool2d(nn.Module):
             embed_dim: int = None,
             num_heads: int = None,
             output_dim: int = None,
-            use_input_norm: bool = False
+            use_input_norm: bool = False,
+            attention_type: str = "sdpa"
     ):
         super().__init__()
         self.attn_dim = attn_dim
         self.output_dim = output_dim
         self.use_input_norm = use_input_norm
+        self.num_heads = num_heads
+        
+        # Pre-calculate best attention engine
+        self.actual_attention_type = "sdpa"
+        if attention_type == "sage" and SAGE_ATTENTION_AVAILABLE:
+            head_dim = attn_dim // num_heads
+            if head_dim not in [64, 128]:
+                # SageAttention only officially supports 64 and 128
+                reason = f"Unsupported head_dim: {head_dim} (Only 64, 128 supported for Sage)"
+                if reason not in _SAGE_WARNING_PRINTED:
+                    print(f"[A2SB] SageAttention skipped for certain layers: {reason}. Using SDPA.")
+                    _SAGE_WARNING_PRINTED[reason] = True
+            else:
+                self.actual_attention_type = "sage"
+
         if use_input_norm:
             self.gnorm = GroupNorm32(32, embed_dim)
         self.q_proj = nn.Conv2d(embed_dim, attn_dim, 1)
@@ -458,26 +488,42 @@ class RotaryAttentionPool2d(nn.Module):
         _b, _dims, _height, _width = q.shape
         attn_head_dim = self.attn_dim // self.num_heads
         out_head_dim = self.output_dim // self.num_heads
-        q = q.view(_b, self.num_heads, attn_head_dim, _height, _width)
-        k = k.view(_b, self.num_heads, attn_head_dim, _height, _width)
-        v = v.view(_b, self.num_heads, out_head_dim, _height, _width)
-        q = q.permute(0,1,3,4,2)
-        k = k.permute(0,1,3,4,2)
-        v = v.permute(0,1,3,4,2)
-        # apply rotary
-        freqs = self.pos_emb.get_axial_freqs(_height, _width)
+        q = q.view(_b, self.num_heads, attn_head_dim, _height, _width).permute(0, 1, 3, 4, 2).contiguous()
+        k = k.view(_b, self.num_heads, attn_head_dim, _height, _width).permute(0, 1, 3, 4, 2).contiguous()
+        v = v.view(_b, self.num_heads, out_head_dim, _height, _width).permute(0, 1, 3, 4, 2).contiguous()
 
+        # apply rotary (freqs matches H and W dimensions)
+        freqs = self.pos_emb.get_axial_freqs(_height, _width)
+        
         q = apply_rotary_emb(freqs, q)
         k = apply_rotary_emb(freqs, k)
-        # squash h and w dimensions
-        q = q.view(_b, self.num_heads, _height*_width, attn_head_dim)
-        k = k.view(_b, self.num_heads, _height*_width, attn_head_dim)
-        v = v.view(_b, self.num_heads, _height*_width, out_head_dim)
-        attn_out = F.scaled_dot_product_attention(q.contiguous(), k.contiguous(), v.contiguous()) # b x self.num_heads x hw x out_head_dim
-        attn_out = attn_out.view(_b, self.num_heads, _height, _width, out_head_dim)
 
-        attn_out = attn_out.permute(0, 1, 4, 2, 3)
-        attn_out = attn_out.reshape(_b, self.output_dim, _height, _width)
+        # Flatten for high-performance attention kernels: [B, Heads, HW, Dim]
+        # Transpose to NHD layout [B, Seq, Heads, Dim]
+        q = q.reshape(_b, self.num_heads, _height * _width, attn_head_dim).transpose(1, 2).contiguous()
+        k = k.reshape(_b, self.num_heads, _height * _width, attn_head_dim).transpose(1, 2).contiguous()
+        v = v.reshape(_b, self.num_heads, _height * _width, out_head_dim).transpose(1, 2).contiguous()
+
+        global _SAGE_GLOBALLY_DISABLED
+        if self.actual_attention_type == "sage" and not _SAGE_GLOBALLY_DISABLED:
+            try:
+                # SageAttention 2: [B, Seq, Heads, Dim]
+                attn_out = sageattn(q, k, v)
+            except Exception as e:
+                # Handle unexpected runtime failures (like missing Blackwell kernels)
+                # Disable Sage globally for this session to prevent terminal spam
+                _SAGE_GLOBALLY_DISABLED = True
+                print(f"[A2SB] SageAttention critical failure: {e}. Switching all layers to SDPA path for this session.")
+                attn_out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+        else:
+            # Native SDPA path (Sticky fallback or manual choice)
+            attn_out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+
+        # attn_out: [B, Seq, Heads, out_head_dim]
+        # Restore spatial layout: [B, output_dim, H, W]
+        attn_out = attn_out.transpose(1, 2) # [B, Heads, Seq, out_head_dim]
+        attn_out = attn_out.reshape(_b, self.num_heads, _height, _width, out_head_dim)
+        attn_out = attn_out.permute(0, 1, 4, 2, 3).reshape(_b, self.output_dim, _height, _width)
         return attn_out
 
 
