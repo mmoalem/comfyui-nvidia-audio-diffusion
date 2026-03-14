@@ -106,13 +106,14 @@ class ResBlock(EmbeddingConditionalBlock):
     def forward(self, x, emb):
         """
         x: torch.tensor B x in_channels x H x W
-        emb: B x emb_in_channels x H x W
+        emb: B x emb_in_channels x 1 x 1 (or B x emb_in_channels x H x W)
         """
-
         h = self.in_layers(x)
-        emb_out = self.emb_layers(emb)#.unsqueeze(-1).unsqueeze(-1)
+        emb_out = self.emb_layers(emb)
+        
         if self.use_scale_shift_norm:
             scale, shift = torch.chunk(emb_out, 2, dim=1)
+            # Broadcasting works automatically if emb_out is [B, 2C, 1, 1]
             h = self.out_norm(h) * (1 + scale) + shift
             h = self.out_rest(h)
         else:
@@ -305,29 +306,45 @@ class AttnUNetF(nn.Module):
         hs = []
 
         h = self.input_projection(x)
-        emb = emb.to(h.dtype)
-        emb_bcasts = []
+        emb = emb.to(h.dtype).view(h.shape[0], -1, 1, 1) # [B, D, 1, 1]
+        
+        # Band embeddings are constant per frequency bin, we can use them via broadcasting
+        # or concatenation if we must. Since ResBlock expects one 'emb' tensor, 
+        # we concatenate the band_emb to the time_emb once at the highest dimension.
+        
+        # Optimization: Don't repeat spatially. Let torch broadcasting/pooling handle it.
+        # However, band_emb is [1, D_band, H, 1]. Time_emb is [B, D_time, 1, 1].
+        # We need a unified [B, D_total, H, 1] that broadcast across W.
+        
         for level in range(self.n_updown_levels):
-            emb_bcast = emb.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, h.shape[2], h.shape[3])
+            # Time embedding doesn't need spatial repeat, but band_emb does (vertical only)
             if self.band_embedding_dim > 0:
-                band_emb = self.get_band_embeddings(h.shape[2], h.device, dtype=h.dtype).repeat(h.shape[0], 1, 1, h.shape[3])
-                emb_bcast = torch.cat((band_emb, emb_bcast), 1)
-            emb_bcasts.append(emb_bcast)
-            h = self.enc_blocks[level](h, emb_bcast)
+                band_emb = self.get_band_embeddings(h.shape[2], h.device, dtype=h.dtype) # [1, D_band, H, 1]
+                curr_emb = torch.cat([band_emb.expand(h.shape[0], -1, -1, -1), emb.expand(-1, -1, h.shape[2], -1)], dim=1)
+            else:
+                curr_emb = emb
+                
+            h = self.enc_blocks[level](h, curr_emb)
             h = self.ds_layers[level](h)
             hs.append(h)
-        # one more for first upsampling layer
-        emb_bcast = emb.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, h.shape[2], h.shape[3])
+            
+        # middle block
         if self.band_embedding_dim > 0:
-                band_emb = self.get_band_embeddings(h.shape[2], h.device, dtype=h.dtype).repeat(h.shape[0], 1, 1, h.shape[3])
-                emb_bcast = torch.cat((band_emb, emb_bcast), 1)
-        emb_bcasts.append(emb_bcast)
-        h = self.middle_block(h, emb_bcast)
+            band_emb = self.get_band_embeddings(h.shape[2], h.device, dtype=h.dtype)
+            curr_emb = torch.cat([band_emb.expand(h.shape[0], -1, -1, -1), emb.expand(-1, -1, h.shape[2], -1)], dim=1)
+        else:
+            curr_emb = emb
+        h = self.middle_block(h, curr_emb)
 
         for level in range(self.n_updown_levels):
             h = h + hs.pop()
-            emb_bcast = emb_bcasts.pop()
-            h = self.dec_blocks[level](h, emb_bcast)
+            # Corresponding embedding for this level (spatially adjusted)
+            if self.band_embedding_dim > 0:
+                band_emb = self.get_band_embeddings(h.shape[2], h.device, dtype=h.dtype)
+                curr_emb = torch.cat([band_emb.expand(h.shape[0], -1, -1, -1), emb.expand(-1, -1, h.shape[2], -1)], dim=1)
+            else:
+                curr_emb = emb
+            h = self.dec_blocks[level](h, curr_emb)
             h = self.us_layers[level](h)
 
         h = self.output_projection(h)

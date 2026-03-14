@@ -34,7 +34,7 @@ def get_multidiffusion_vf(vf_model, x_t, t_emb, win_length=256, hop_length=128, 
     total_samples = windows.shape[0]
     
     for i in range(0, total_samples, batch_size):
-        curr_batch_x = windows[i : i + batch_size]
+        curr_batch_x = windows[i : i + batch_size].contiguous().to(memory_format=torch.channels_last)
         # Repeat time embedding for each window in the batch
         # t_emb is [B, D]. We need it to match curr_batch_x[i].
         # In the bandwidth node, t_emb passed is [B, D].

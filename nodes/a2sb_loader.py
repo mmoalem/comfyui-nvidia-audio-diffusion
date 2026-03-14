@@ -18,6 +18,7 @@ class A2SB_ModelLoader:
                 "model_type": (["2-split (recommended)", "1-split"], {"default": "2-split (recommended)"}),
                 "precision": (["fp32", "bf16", "fp16"], {"default": "bf16"}),
                 "use_ot_ode": ("BOOLEAN", {"default": False}),
+                "use_compile": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -57,7 +58,7 @@ class A2SB_ModelLoader:
             num_res_blocks=2
         )
 
-    def load_weights(self, network, checkpoint_path):
+    def load_weights(self, network, checkpoint_path, dtype):
         state_dict = torch.load(checkpoint_path, map_location="cpu")
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
@@ -66,9 +67,12 @@ class A2SB_ModelLoader:
         for key, value in state_dict.items():
             if "vf_model." in key:
                 new_key = key.replace("vf_model.", "")
-                new_state_dict[new_key] = value
-                
-        network.load_state_dict(new_state_dict)
+                # Only apply channels_last to 4D tensors (convolutions)
+                v = value.to(dtype)
+                if v.ndim == 4:
+                    v = v.to(memory_format=torch.channels_last)
+                new_state_dict[new_key] = v
+        network.load_state_dict(new_state_dict, strict=True)
         return network
 
     def wrap_model(self, network):
@@ -88,7 +92,7 @@ class A2SB_ModelLoader:
         )
         return patcher
 
-    def load_model(self, model_type, precision, use_ot_ode):
+    def load_model(self, model_type, precision, use_ot_ode, use_compile):
         import logging
         logging.info(f"[A2SB] Loading model type: {model_type}, precision: {precision}")
         
@@ -109,13 +113,19 @@ class A2SB_ModelLoader:
             p2 = self.download_model(file2)
             
             net1 = self.instantiate_network()
-            net1 = self.load_weights(net1, p1)
-            net1.to(dtype)
+            net1.to(dtype).to(memory_format=torch.channels_last)
+            net1 = self.load_weights(net1, p1, dtype)
+            if use_compile:
+                print("[A2SB] Compiling model 1...")
+                net1 = torch.compile(net1)
             models.append(self.wrap_model(net1))
             
             net2 = self.instantiate_network()
-            net2 = self.load_weights(net2, p2)
-            net2.to(dtype)
+            net2.to(dtype).to(memory_format=torch.channels_last)
+            net2 = self.load_weights(net2, p2, dtype)
+            if use_compile:
+                print("[A2SB] Compiling model 2...")
+                net2 = torch.compile(net2)
             models.append(self.wrap_model(net2))
             
             t_cutoffs = [0.5]
@@ -125,8 +135,11 @@ class A2SB_ModelLoader:
             p1 = self.download_model(file1)
             
             net1 = self.instantiate_network()
-            net1 = self.load_weights(net1, p1)
-            net1.to(dtype)
+            net1.to(dtype).to(memory_format=torch.channels_last)
+            net1 = self.load_weights(net1, p1, dtype)
+            if use_compile:
+                print("[A2SB] Compiling model...")
+                net1 = torch.compile(net1)
             models.append(self.wrap_model(net1))
             t_cutoffs = []
             

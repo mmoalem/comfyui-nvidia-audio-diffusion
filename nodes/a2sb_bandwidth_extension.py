@@ -24,6 +24,7 @@ class A2SB_BandwidthExtension:
                 "audio": ("AUDIO",),
                 "steps": ("INT", {"default": 50, "min": 10, "max": 200}),
                 "cutoff_freq": ("INT", {"default": 0, "min": 0, "max": 22050}),
+                "refiner_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0}),
                 "batch_size": ("INT", {"default": 16, "min": 1, "max": 64}),
                 "unload_model": ("BOOLEAN", {"default": True}),
             }
@@ -94,7 +95,7 @@ class A2SB_BandwidthExtension:
         else:
             return resampled.squeeze(0)
 
-    def extend_bandwidth(self, a2sb_model, audio, steps, cutoff_freq, batch_size, unload_model):
+    def extend_bandwidth(self, a2sb_model, audio, steps, cutoff_freq, refiner_strength, batch_size, unload_model):
         mm.throw_exception_if_processing_interrupted()
         device = mm.get_torch_device()
         
@@ -177,8 +178,8 @@ class A2SB_BandwidthExtension:
         mm.load_models_gpu(models)
 
         # 4. Sampling Loop (Diffusion)
-        print(f"[A2SB] Starting sampling over {steps} steps (Batch: {n_channels})...")
-        t_steps = torch.linspace(1, 0.05, int(steps)).to(device).to(dtype)
+        print(f"[A2SB] Starting sampling over {steps} steps (Batch: {n_channels}, Refiner: {refiner_strength})...")
+        t_steps = torch.linspace(refiner_strength, 0.05, int(steps)).to(device).to(dtype)
         n_steps = len(t_steps) - 1
         
         win_length = 256

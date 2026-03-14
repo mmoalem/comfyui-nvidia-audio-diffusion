@@ -48,3 +48,52 @@ class TimestampedSegmentInpaintMaskTransform:
         mask[:, :, self.start_idx:self.end_idx] = 1
         masked_and_noised_spec = mask_with_noise(spec, mask, self.fill_noise_level)
         return masked_and_noised_spec, mask
+
+class AutoDeclipMask:
+    def __init__(self, threshold=0.99, padding_ms=5, sampling_rate=44100, hop_length=512):
+        self.threshold = threshold
+        self.padding_bins = int(sampling_rate / hop_length * (padding_ms / 1000.0))
+
+    def __call__(self, waveform: torch.Tensor, spec_height: int, spec_len: int) -> torch.Tensor:
+        """
+        waveform: [C, S]
+        Returns: [C, 3, spec_height, spec_len] mask
+        """
+        c, s = waveform.shape
+        # 1. Detect clipping in time domain
+        # waveform is on device
+        is_clipped = (waveform.abs() >= self.threshold).float() # [C, S]
+        
+        # 2. Map to STFT bins (rough approximation)
+        # Each STFT frame represents 512 samples
+        # We use max-pooling to catch any clipping within the frame
+        # [C, 1, S] -> [C, 1, L_stft]
+        clipped_frames = torch.nn.functional.max_pool1d(
+            is_clipped.unsqueeze(1), 
+            kernel_size=512, 
+            stride=512
+        ).squeeze(1) # [C, L_stft]
+        
+        # 3. Add padding to masks (dilate)
+        if self.padding_bins > 0:
+            kernel = torch.ones(1, 1, self.padding_bins * 2 + 1).to(waveform.device)
+            clipped_frames = torch.nn.functional.conv1d(
+                clipped_frames.unsqueeze(1), 
+                kernel, 
+                padding=self.padding_bins
+            ).squeeze(1) > 0
+            clipped_frames = clipped_frames.float()
+
+        # 4. Expand to full 4D mask [C, 3, H, L]
+        # [C, 1, 1, L_stft]
+        mask = clipped_frames.view(c, 1, 1, -1)
+        mask = mask.expand(-1, 3, spec_height, -1).contiguous()
+        
+        # Ensure length matches spec_len
+        if mask.shape[-1] > spec_len:
+            mask = mask[..., :spec_len]
+        elif mask.shape[-1] < spec_len:
+            pad = spec_len - mask.shape[-1]
+            mask = torch.cat([mask, mask[..., -1:].repeat(1, 1, 1, pad)], dim=-1)
+            
+        return mask

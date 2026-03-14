@@ -11,7 +11,7 @@ from a2sb.audio_transforms.transforms import (
     ComplexSpectrogram, ComplexToMagInstPhase, SpectrogramDropDCTerm, PowerScaleSpectrogram,
     SpectrogramAddDCTerm, SVDFixMagInstPhase, MagInstPhaseToComplex, InverseComplexSpectrogram
 )
-from a2sb.corruption.corruptions import mask_with_noise
+from a2sb.corruption.corruptions import mask_with_noise, AutoDeclipMask
 from a2sb.diffusion import multidiffusion_pad_inputs, multidiffusion_unpad_outputs, get_multidiffusion_vf
 from a2sb.networks import SinusoidalTemporalEmbedding
 from a2sb.utils import find_middle_of_zero_segments
@@ -26,6 +26,9 @@ class A2SB_Inpainting:
                 "steps": ("INT", {"default": 50, "min": 10, "max": 200}),
                 "segments": ("STRING", {"default": "1.0-1.5, 3.0-4.0", "multiline": False}),
                 "batch_size": ("INT", {"default": 16, "min": 1, "max": 64}),
+                "auto_declip": ("BOOLEAN", {"default": False}),
+                "declip_threshold": ("FLOAT", {"default": 0.99, "min": 0.8, "max": 1.0, "step": 0.01}),
+                "refiner_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0}),
                 "fast_mode": ("BOOLEAN", {"default": True}),
                 "unload_model": ("BOOLEAN", {"default": True}),
             }
@@ -67,7 +70,7 @@ class A2SB_Inpainting:
                 segments.append((float(start.strip()), float(end.strip())))
         return segments
 
-    def inpaint_audio(self, a2sb_model, audio, steps, segments, batch_size, fast_mode, unload_model):
+    def inpaint_audio(self, a2sb_model, audio, steps, segments, batch_size, auto_declip, declip_threshold, refiner_strength, fast_mode, unload_model):
         mm.throw_exception_if_processing_interrupted()
         device = mm.get_torch_device()
         
@@ -133,6 +136,12 @@ class A2SB_Inpainting:
             end_idx = min(stft_target.shape[-1], end_idx)
             if start_idx < end_idx:
                 mask[:, :, :, start_idx:end_idx] = 1
+        
+        if auto_declip:
+            print(f"[A2SB] Detecting clipping at threshold {declip_threshold}...")
+            declip_mask_gen = AutoDeclipMask(threshold=declip_threshold)
+            declip_mask = declip_mask_gen(original_audio, stft_target.shape[2], stft_target.shape[3])
+            mask = torch.max(mask, declip_mask) # Merge masks
             
         noise_level = 0.5
         stft_corrupted = mask_with_noise(stft_target, mask, noise_level)
@@ -147,8 +156,8 @@ class A2SB_Inpainting:
         mm.load_models_gpu(models)
 
         # 4. Sampling Loop
-        print(f"[A2SB] Starting inpainting over {steps} steps (Batch: {n_channels})...")
-        t_steps = torch.linspace(1, 0.05, int(steps)).to(device).to(dtype)
+        print(f"[A2SB] Starting inpainting over {steps} steps (Batch: {n_channels}, Refiner: {refiner_strength})...")
+        t_steps = torch.linspace(refiner_strength, 0.05, int(steps)).to(device).to(dtype)
         n_steps = len(t_steps) - 1
         
         win_length = 256
