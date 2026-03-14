@@ -455,11 +455,11 @@ class RotaryAttentionPool2d(nn.Module):
         self.actual_attention_type = "sdpa"
         if attention_type == "sage" and SAGE_ATTENTION_AVAILABLE:
             head_dim = attn_dim // num_heads
-            if head_dim not in [64, 128]:
-                # SageAttention only officially supports 64 and 128
-                reason = f"Unsupported head_dim: {head_dim} (Only 64, 128 supported for Sage)"
+            # SageAttention 2 supports head_dim 64, 96, and 128
+            if head_dim not in [64, 96, 128]:
+                reason = f"Unsupported head_dim: {head_dim} (Sage 2 supports 64, 96, 128)"
                 if reason not in _SAGE_WARNING_PRINTED:
-                    print(f"[A2SB] SageAttention skipped for certain layers: {reason}. Using SDPA.")
+                    print(f"[A2SB] SageAttention skipped for layers with head_dim {head_dim}. Using SDPA.")
                     _SAGE_WARNING_PRINTED[reason] = True
             else:
                 self.actual_attention_type = "sage"
