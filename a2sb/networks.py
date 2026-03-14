@@ -507,16 +507,25 @@ class RotaryAttentionPool2d(nn.Module):
         global _SAGE_GLOBALLY_DISABLED
         if self.actual_attention_type == "sage" and not _SAGE_GLOBALLY_DISABLED:
             try:
-                # SageAttention 2: [B, Seq, Heads, Dim]
-                attn_out = sageattn(q, k, v)
+                # tensor_layout="NHD" is required — tensors are [B, Seq, Heads, Dim].
+                # Without it SA2 assumes HND layout and dispatches the wrong kernel,
+                # causing cudaErrorNoKernelImageForDevice on Blackwell (SM_120) GPUs.
+                attn_out = sageattn(q, k, v, tensor_layout="NHD", is_causal=False)
             except Exception as e:
-                # Handle unexpected runtime failures (like missing Blackwell kernels)
-                # Disable Sage globally for this session to prevent terminal spam
-                _SAGE_GLOBALLY_DISABLED = True
-                print(f"[A2SB] SageAttention critical failure: {e}. Switching all layers to SDPA path for this session.")
+                error_str = str(e)
+                if "no kernel image" in error_str or "cudaErrorNoKernelImageForDevice" in error_str:
+                    # Per-layer sticky fallback — other head_dim layers may still work.
+                    reason = f"No SA2 kernel for head_dim={q.shape[-1]} on this GPU arch"
+                    if reason not in _SAGE_WARNING_PRINTED:
+                        print(f"[A2SB] SageAttention kernel unavailable for head_dim={q.shape[-1]}. "
+                              f"Falling back to SDPA for this layer only.")
+                        _SAGE_WARNING_PRINTED[reason] = True
+                    self.actual_attention_type = "sdpa"
+                else:
+                    _SAGE_GLOBALLY_DISABLED = True
+                    print(f"[A2SB] SageAttention unexpected failure: {e}. Switching all layers to SDPA.")
                 attn_out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
         else:
-            # Native SDPA path (Sticky fallback or manual choice)
             attn_out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
 
         # attn_out: [B, Seq, Heads, out_head_dim]
