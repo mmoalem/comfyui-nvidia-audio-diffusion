@@ -21,7 +21,7 @@ A ComfyUI custom node suite for **Audio-to-Audio Schrödinger Bridges (A2SB)**. 
 1. **Clone the repository**:
    ```bash
    cd custom_nodes
-   git clone https://github.com/[your-username]/ComfyUI-A2SB
+   git clone [https://github.com/mmoalem/comfyui-nvidia-audio-diffusion]
    ```
 
 2. **Install dependencies**:
